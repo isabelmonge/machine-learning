@@ -45,4 +45,6 @@ Demonstrates how supervised learning can be used to understand drivers of host p
 ## How to Use
 
 - To **run the code**, open the `.Rmd` files in RStudio and knit them.  
-- To **read the results only**, open the `.html` files directly in your browser.
+- To **read the results only**, open the `.html` files directly in your browser.  
+- The **Airbnb project** uses the dataset `listings.csv`.  
+- The **Flights project** uses the dataset `weather_data.csv`.
