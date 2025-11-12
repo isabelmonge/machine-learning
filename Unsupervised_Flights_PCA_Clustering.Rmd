@@ -1,0 +1,977 @@
+---
+title: "Midterm"
+author: "Isabel Monge"
+output: html_document
+date: "2025-02-26"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "/Users/isabelmonge/Desktop/advanced modeling/Midterm")
+```
+
+```{r, message=FALSE}
+library(tidyverse)
+library(dplyr)
+library(readr)
+library(readxl)
+library(httr) 
+library(jsonlite)
+library(DataExplorer)
+library(ggplot2)
+library(GGally)
+library(mice)
+library(factoextra)
+library(gridExtra)
+library(cluster)
+library(mclust)
+library(plotly)
+library(MASS)
+library(leaflet)
+
+#for reproduceability
+set.seed(123)
+```
+
+## Research question
+
+Commercial airports in the United States vary in size, infrastructure, passenger volume, environmental conditions, and the types and frequency of delays they experience. These differences affect how airports operate and the challenges they face. Understanding these patterns is important for airport management, transportation planning, and infrastructure investment. However, there is no standard way to classify airports based on their characteristics.
+
+This study uses Principal Component Analysis (PCA) and clustering to uncover patterns in airport data. It seeks to answer the following questions:
+
+-   What key dimensions define variation among airports?
+
+-   How do airports naturally cluster based on their characteristics?
+
+These findings provide a data-driven framework for understanding airport differences. Airport authorities and policymakers can use this classification to assess infrastructure needs, allocate funding, and develop policies suited to different types of airports. Airlines can use these insights to refine scheduling strategies, optimize route planning, and anticipate operational challenges at different airport types. By identifying patterns in airport characteristics, this study offers a structured way to compare airports and support decisions that improve efficiency and resource management.
+
+## Download the variables
+
+### Airport metadata
+
+First I will load the OpenFlights data to get IATA codes. I will use these codes as a key when joining other datasets, and will use the latitude and longitude to match weather data.
+
+```{r}
+#load OpenFlights data
+airport_info <- read_csv("airports.dat", col_names = FALSE)
+
+#rename columns
+colnames(airport_info) <- c("airport_id", "airport_name", "city", "country", "iata", "icao", "latitude", "longitude", "altitude", "timezone", "dst", "type", "source")
+
+#filter for relevant columns
+airport_info <- airport_info |> 
+  dplyr::select(iata, airport_name, city, country, latitude, longitude) |> 
+  dplyr::rename(airport_code = iata)
+
+#filter for U.S. airports only
+us_airports <- airport_info |> filter(country == "United States")
+```
+
+### Delay data
+
+Next I will load BTS data, that contains data about all types of flight delays.
+
+```{r pressure, echo=FALSE}
+# Load BTS delay data
+delay_data <- read_csv("Airline_Delay_Cause.csv") |> 
+  dplyr::select(month, airport, arr_flights, weather_delay, carrier_delay, nas_delay, security_delay, late_aircraft_delay) |>  
+  dplyr::rename(airport_code = airport)
+
+delay_data <- delay_data |> 
+  group_by(airport_code) |> 
+  summarize(
+    arr_flights = sum(arr_flights, na.rm = TRUE),
+    weather_delay = sum(weather_delay, na.rm = TRUE),
+    carrier_delay = sum(carrier_delay, na.rm = TRUE),
+    nas_delay = sum(nas_delay, na.rm = TRUE),
+    security_delay = sum(security_delay, na.rm = TRUE),
+    late_aircraft_delay = sum(late_aircraft_delay, na.rm = TRUE),
+    .groups = "drop"   
+  ) |>
+  transmute(
+    airport_code = airport_code,
+    arr_flights = arr_flights,
+    weather_delay_rate = weather_delay / arr_flights,
+    carrier_delay_rate = carrier_delay / arr_flights,
+    nas_delay_rate = nas_delay / arr_flights,
+    security_delay_rate = security_delay / arr_flights,
+    late_aircraft_delay_rate = late_aircraft_delay / arr_flights
+  )
+
+#join data
+delay_data_us <- delay_data |>
+  left_join(airport_info, by = "airport_code")
+```
+
+### Enplanement data
+
+Then I will load data about enplanements, or the number of passengers boarding an aircraft.
+
+```{r}
+airport_size <- read_excel("cy23-commercial-service-enplanements.xlsx")
+
+airport_size <- airport_size |> 
+  dplyr::select("Locid", "CY 23 Enplanements") |> 
+  dplyr::rename(enplanements = `CY 23 Enplanements`)
+  
+
+delay_size_us <- delay_data_us |>
+  left_join(airport_size, by = c("airport_code" = "Locid"))
+
+```
+
+### Runway data
+
+Next I will load in data about airport runways including total number, length, width, and elevation.
+
+```{r}
+runways_data <- read_csv("Runways_IATA.csv")
+
+runways_data <- runways_data |> 
+  filter(!is.na(iata_code)) |> 
+  group_by(iata_code) |> 
+  summarize(
+    num_runways = n(),
+    elevation_ft = first(le_elevation_ft),  #Assumes consistent elevation at airport
+    total_runway_length = sum(length_ft, na.rm = TRUE),
+    total_runway_width = sum(width_ft, na.rm = TRUE)  
+  )
+
+
+#join data
+delay_size_runways_us <- delay_size_us |> 
+  left_join(runways_data, by = c("airport_code" = "iata_code"))
+```
+
+### Development budget data
+
+I will then load in data about the projected budget for each airport for a four-year period including 2023.
+
+```{r}
+dev_estimate <- read_excel("dev estimate.xlsx", skip = 1)
+
+dev_estimate <- dev_estimate |> 
+  dplyr::select(Locid, '2021-2025\r\nDev Estimate') |> 
+  dplyr::rename(dev_estimate = '2021-2025\r\nDev Estimate')
+
+#join data
+delay_size_runways_dev <- delay_size_runways_us |> 
+  left_join(dev_estimate, by = c("airport_code" = "Locid"))
+```
+
+### Weather data
+
+Finally I will create a function to get weather data from Open-Meteo API (*Note: you will only be to make 100 calls before reaching the limit for the free tier of this service. Therefore, I've saved the full data in the attached weather_data.csv*).
+
+```{r, eval=FALSE}
+
+#get unique cities with their coordinates
+cities_coords <- delay_size_runways_dev |> 
+  dplyr::select(city, latitude, longitude) |> 
+  distinct()
+
+unique_cities <- cities_coords %>% 
+  distinct(city, latitude, longitude)
+
+#function to pull weather data for each city
+get_weather <- function(lat, lon, city) {
+  print(paste("Getting weather for:", city))
+  
+  base_url <- "https://archive-api.open-meteo.com/v1/archive"
+  url <- sprintf("%s?latitude=%f&longitude=%f&start_date=2023-01-01&end_date=2023-31-12&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,rain_sum,snowfall_sum&timezone=America/New_York",
+                 base_url, lat, lon)
+  
+  response <- GET(url)
+  Sys.sleep(0.5)
+  
+  if (status_code(response) == 200) {
+    weather_data <- fromJSON(rawToChar(response$content))
+    result <- as.data.frame(weather_data$daily)
+    result$city <- city  
+    return(result)
+  } else {
+    return(data.frame(
+      time = character(),
+      temperature_2m_max = numeric(),
+      temperature_2m_min = numeric(),
+      precipitation_sum = numeric(),
+      rain_sum = numeric(),
+      snowfall_sum = numeric(),
+      city = character()
+    ))
+  }
+}
+
+#get weather for all cities
+weather_data <- unique_cities %>%
+  rowwise() %>%  # Change to rowwise() instead of group_by()
+  do(get_weather(.$latitude, .$longitude, .$city)) %>%
+  ungroup()
+
+#save the data
+write.csv(weather_data, "weather_data_2023.csv", row.names = FALSE)
+```
+
+After loading in the weather data, I will summarize it by year. Then I will join the weather dataset with my other data. Now we have all of our variables!
+
+```{r}
+weather_data <- read_csv("weather_data.csv")
+
+weather_data <- weather_data |> 
+  mutate(year = year(time)) |> 
+  group_by(city, year) |> 
+  summarize(
+    p90_max_temp = quantile(temperature_2m_max, 0.90, na.rm = TRUE),
+    p10_min_temp = quantile(temperature_2m_min, 0.10, na.rm = TRUE),
+    temp_range = max(temperature_2m_max, na.rm = TRUE) - min(temperature_2m_min, na.rm = TRUE), 
+    total_rain = sum(rain_sum, na.rm = TRUE),
+    total_snow = sum(snowfall_sum, na.rm = TRUE),
+    .groups = "drop")
+
+#join data
+final_flights <- delay_size_runways_dev |> 
+  left_join(weather_data, by = "city")
+
+#I will use this later to create maps
+airport_locations <- final_flights |> 
+  dplyr::select(airport_code, latitude, longitude) |> 
+  distinct()  
+
+#remove key columns that aren't useful for analysis
+final_flights <- final_flights |> 
+  dplyr::select(-year, -country, -airport_name, -latitude, -longitude, -city)
+```
+
+## Descriptive analysis and preprocessing
+
+### Check for missing values and decide on imputation
+
+I can see that my dataset has nearly all continuous variables which is ideal for PCA and clustering. The only non-numeric variable is `airport_code`, which I will keep for my graphs later on. I can also see that while most rows are complete, about 6% are missing some data.
+
+```{r}
+plot_intro(final_flights)
+
+#non-numeric variables
+names(final_flights)[!sapply(final_flights, is.numeric)]
+```
+
+Even though only 6% of rows have missing data, I’ll impute with MICE rather than drop them. Removing these observations would unnecessarily shrink my sample size and could bias the analysis. Now I have no missing observations in my dataset.
+
+```{r}
+#inspect missing observations per row
+missing_rows <- final_flights |> 
+  filter(if_any(everything(), is.na))
+missing_rows
+
+#impute using MICE
+m = 4 
+mice_mod <- mice(final_flights, m=m, method='rf')
+final_flights <- complete(mice_mod, action=m)
+
+#check that missing values are filled
+sum(is.na(final_flights))
+```
+
+### Check feature distribution to identify skew and scaling issues
+
+Next I will check feature distribution to determine if any variables should be transformed. I observe that some variables, such as `arr_flights`, `enplanements`, and `dev_estimate` are highly skewed. Therefore, I will apply a logarithmic transformation to these variables. Additionally, my features have different scales. Therefore, I will ensure all features are standardized when running PCA and clustering using `scale()`, so they contribute equally.
+
+```{r}
+#plot histograms
+df_long <- final_flights |> 
+  dplyr::select(where(is.numeric)) |> 
+  pivot_longer(cols = everything(), names_to = "feature", values_to = "value")
+
+ggplot(df_long, aes(x = value)) +
+  geom_histogram(bins = 30, fill = "steelblue", alpha = 0.7) +
+  facet_wrap(~feature, scales = "free") +
+  theme_minimal() +
+  labs(title = "Distribution of Features")
+
+#log transform skewed variables
+final_flights <- final_flights |> 
+  mutate(across(c(arr_flights, enplanements, dev_estimate, 
+                  total_snow, weather_delay_rate, total_runway_length), log1p))
+                  #log1p(x) ensures zeros remain well-defined 
+
+```
+
+### Check correlation
+
+Next, I'll examine the correlation between my variables. I observe strong correlations among a few variables (e.g., delay metrics, temperature metrics, and airport infrastructure measures), indicating that some features capture similar patterns in the data. These correlations suggest that PCA can effectively reduce dimensionality by combining highly related variables into principal components. However, since there are more weak than strong correlations, I may need more PCs to retain enough variance for clustering to perform well.
+
+```{r, warning=FALSE}
+ggcorr(final_flights, label = T)
+```
+
+## PCA
+
+### Overview
+
+After removing non-numeric variables and scaling the data, I will run PCA. The results show that PC1 and PC2 capture just under 50% of the variance (31.6% and 16.5%), with the first 10 PCs explaining over 92%. This means I can use fewer dimensions without losing important patterns in the data.
+
+```{r}
+#store airport codes separately
+airport_codes <- final_flights$airport_code 
+
+#remove airport code for now, since we can only use numeric variables
+flights_numeric <- final_flights |> 
+  dplyr::select(-airport_code)
+
+#use PCA
+pca = prcomp(flights_numeric, scale = TRUE) #don't forget to scale!
+summary(pca)
+```
+
+The scree plot further illustrates that there's a notable drop after the first component and again after the second, confirming these two dimensions are most influential. Components 3 and 4 still contribute meaningfully (9.7% and 9.1%), so I will focus on these four dimensions in my analysis to capture approximately 67% of the total variance.
+
+```{r}
+fviz_eig(pca, addlabels = TRUE, ylim = c(0, 50))
+```
+
+### PC1
+
+PC1 seems to capture **airport size and traffic**. Airports with lower PC1 scores tend to be larger, busier hubs with high passenger traffic, more arriving flights, and longer runways (ex. Chicago, Los Angeles, Dallas). In contrast, airports with higher PC1 scores are generally smaller, with fewer flights, shorter runways, and lower passenger volumes.
+
+```{r}
+pca$rotation[,1]
+
+#visualization
+fviz_contrib(pca, choice = "var", axes = 1)
+
+#top 10 airports for PC1
+airport_codes[order(pca$x[,1], decreasing = TRUE)][1:10]
+
+#bottom 10
+airport_codes[order(pca$x[,1])][1:10]  
+
+```
+
+### PC2
+
+PC2 captures **broad climate characteristics**, primarily distinguishing warm, rainy, low-elevation locations from cold, snowy, high-altitude locations. Airports with high PC2 scores, such as those in Key West and Hawaii are located in tropical or coastal regions with consistently warm temperatures and frequent rainfall. In contrast, airports with low PC2 scores, like those in Denver, Minneapolis, and Fairbanks, are situated in colder climates where snowfall and seasonal temperature variation are common.
+
+```{r}
+pca$rotation[,2]
+
+#visualization
+fviz_contrib(pca, choice = "var", axes = 2)
+
+#top 10 airports for PC2
+airport_codes[order(pca$x[,2], decreasing = TRUE)][1:10]
+
+#bottom 10
+airport_codes[order(pca$x[,2])][1:10]  
+```
+
+### PC3
+
+PC3 differentiates airports based on the **primary causes of delays**. Airports with higher PC3 scores usually experience delays caused by airline scheduling issues, air traffic control restrictions, or inefficiencies in airport turnaround operations rather than external environmental factors. In contrast, airports with lower PC3 scores may have more weather-independent, infrastructure-related disruptions.
+
+```{r}
+pca$rotation[,3]
+
+#visualization
+fviz_contrib(pca, choice = "var", axes = 3)
+
+#top 10 airports for PC3
+airport_codes[order(pca$x[,3], decreasing = TRUE)][1:10]
+
+#bottom 10
+airport_codes[order(pca$x[,3])][1:10]  
+```
+
+### PC4
+
+PC4 is also about weather but measures **total precipitation**, whether from heavy rainfall or snowfall. Unlike PC2, which distinguishes warm, humid regions from cold, snowy ones, PC4 groups both tropical, rainy and airports and cold, snowy airports together due to their high precipitation levels. In contrast, airports with low PC4 scores, such as those in Arizona, Texas, and New Mexico, are defined by their dry conditions, receiving little to no precipitation, regardless of temperature.
+
+```{r}
+pca$rotation[,4]
+
+#visualization
+fviz_contrib(pca, choice = "var", axes = 4)
+
+#top 10 airports for PC4
+airport_codes[order(pca$x[,4], decreasing = TRUE)][1:10]
+
+#bottom 10
+airport_codes[order(pca$x[,4])][1:10]  
+```
+
+The PC2 vs. PC4 plot below shows how airports vary in climate (PC2) and precipitation levels (PC4). PC2 separates warm, low-elevation airports (right) from cold, high-altitude ones (left), while PC4 distinguishes wet (top) from dry (bottom) locations. Alaskan airports cluster at the top left, reflecting cold temperatures and extreme precipitation, while desert airports like Yuma and Laredo appear at the bottom-right, indicating hot, dry conditions. The scattered, oval-like shape of the data suggests that while climate and precipitation are related, they are not perfectly correlated.
+
+```{r}
+#create a dataframe with PC scores and airport weather data
+airport_pca <- data.frame(
+  PC2 = pca$x[,2], 
+  PC4 = pca$x[,4], 
+  airport_code = airport_codes,
+  max_temp = final_flights$p90_max_temp,
+  min_temp = final_flights$p10_min_temp,
+  total_rain = final_flights$total_rain,
+  total_snow = final_flights$total_snow
+)
+
+#define categories based on temp and precipitation
+airport_pca <- airport_pca %>%
+  mutate(climate_category = case_when(
+    max_temp < 30.6 & (total_rain > 925.7 | total_snow > 3.6) ~ "Cold + Wet",
+    max_temp < 30.6 & (total_rain <= 925.7 & total_snow <= 3.6) ~ "Cold + Dry",
+    max_temp >= 30.6 & total_rain > 925.7 ~ "Hot + Wet",
+    max_temp >= 30.6 & total_rain <= 925.7 ~ "Hot + Dry"
+  ))
+
+#plot
+ggplot(airport_pca, aes(x = PC2, y = PC4, label = airport_code, color = climate_category)) +
+  geom_text(size = 2.5, alpha = 0.8) + 
+  geom_point(aes(x = 0, y = 0), size = 0) +  #dummy points to generate legend correctly
+  scale_color_manual(values = c("Cold + Wet" = "blue", 
+                                "Cold + Dry" = "purple",
+                                "Hot + Wet" = "green", 
+                                "Hot + Dry" = "red")) +
+  labs(title = "PC2 vs. PC4: Airport Climate and Precipitation",
+       x = "PC2 (Climate & Geography)",
+       y = "PC4 (Wet vs. Dry)",
+       color = "Climate Category") +  # Correct legend title
+  theme_minimal() +
+  theme(legend.position = "right",       
+        legend.title = element_text(size = 12, face = "bold"),  
+        legend.text = element_text(size = 10, face = "plain")) +
+  
+  guides(color = guide_legend(override.aes = list(size = 4, shape = 16))) 
+```
+
+## Clustering
+
+My next step is to apply clustering techniques. Clustering is a fundamental tool in unsupervised learning that groups similar observations together based on certain characteristics. In this section, I will use two methods: K-means and hierarchical clustering, to explore the structure of my data and gain insights into distinct clusters of airports.
+
+### Hints for number of clusters
+
+In clustering, selecting the appropriate number of clusters is one of the most important steps. Therefore, I will use three graphing methods as hints to find the optimal number. These results suggest anywhere between 2-6 clusters. To me, 2 seems to simple, while 6 seems like too many clusters to interpret. Therefore, I will test k = 3, 4, and 5 since they provide a good balance between detailed groupings and interpretability.
+
+```{r}
+#elbow method 
+fviz_nbclust(flights_numeric, kmeans, method = "wss", k.max = 10, nstart = 25) +
+  theme_minimal() + ggtitle("Elbow Method")
+
+#silhouette method
+fviz_nbclust(flights_numeric, kmeans, method = "silhouette", k.max = 10, nstart = 25) +
+  theme_minimal() + ggtitle("Silhouette Method")
+
+#gap statistic
+fviz_nbclust(flights_numeric, kmeans, method = "gap_stat", k.max = 10, nstart = 25, nboot=100)   + theme_minimal() + ggtitle("Gap Statistic")
+```
+
+### K-means clustering
+
+I will start by using K-means to create 3 clusters:
+
+```{r}
+#kmeans with 3 clusters
+fit_km_3 <- kmeans(scale(flights_numeric), centers = 3, nstart = 1000) #remember to scale
+fit_km_3
+```
+
+The clusters reveal three main types of airports: warm climate airports with minimal seasonal variation, high-altitude, snowy airports that face weather delays, and large airports with extensive flight operations and logistical delays. These clusters already seem well defined to me, but let's experiment with a few more.
+
+```{r}
+centers=fit_km_3$centers
+k <- 3 
+
+par(mfrow = c(2, 3))
+for (i in 1:k) {
+  colors <- ifelse(centers[i, ] > 0, "blue", "red") 
+  barplot(centers[i, ],  
+          main = paste("Cluster", i, "Center"), 
+          las = 2, 
+          col = colors,
+          ylim = c(min(centers), max(centers)))
+}
+par(mfrow = c(1, 1))
+```
+
+Next I will try 4 clusters:
+
+```{r}
+#kmeans with 4 clusters
+fit_km_4 <- kmeans(scale(flights_numeric), centers = 4, nstart = 1000) #remember to scale
+fit_km_4
+```
+
+In addition to the three clusters identified above, adding a fourth cluster introduces average-performance airports with no extreme metrics across any dimension.
+
+```{r}
+centers=fit_km_4$centers
+k <- 4
+
+par(mfrow = c(2, 3))
+for (i in 1:k) {
+  colors <- ifelse(centers[i, ] > 0, "blue", "red")
+  barplot(centers[i, ], 
+          main = paste("Cluster", i, "Center"), 
+          las = 2, 
+          col = colors,
+          ylim = c(min(centers), max(centers)))
+}
+par(mfrow = c(1, 1))
+```
+
+Finally I will try 5 clusters:
+
+```{r}
+#kmeans with 5 clusters
+fit_km_5 <- kmeans(scale(flights_numeric), centers = 5, nstart = 1000) #remember to scale
+fit_km_5
+```
+
+The five-cluster solution introduces a delay-prone cluster with systemic issues across all delay metrics. The other clusters remain largely the same as those identified in the four-cluster solution.
+
+```{r}
+centers=fit_km_5$centers
+k <- 5 
+
+par(mfrow = c(2, 3))
+for (i in 1:k) {
+  colors <- ifelse(centers[i, ] > 0, "blue", "red")
+  barplot(centers[i, ], 
+          main = paste("Cluster", i, "Center"), 
+          las = 2, 
+          col = colors,
+          ylim = c(min(centers), max(centers)))
+}
+par(mfrow = c(1, 1))
+```
+
+While the additional clusters are interesting, they are increasingly harder for me to interpret as those with small variation from 0 started to blend with one another. I would therefore select just 3 clusters for simplicity of interpretation. However, airport authorities or airlines conducting more granular operational analysis might prefer additional clusters to capture subtle variations. The balance of granularity versus interpretability always depends on the researcher and their objectives.
+
+### K-means visualizations
+
+I created two graphs to visualize both the statistical clustering and geographic distribution of airport types across the United States. The PCA plot (first image) demonstrates how the airports separate into three distinct groups based on their operational characteristics, while the map (second image) reveals clear regional patterns in these clusters. Together, they show how climate, geography, and infrastructure requirements create natural groupings of airports, with warm-weather facilities dominating the South, high-volume hubs concentrated on the coasts and major cities, and snowy, high-altitude airports clustered in northern and mountainous regions.
+
+```{r}
+#convert PCA results into a data frame
+pca_df <- as.data.frame(pca$x)
+
+#create a clustering object from hierarchical clustering
+cluster_kmeans <- as.factor(fit_km_3$cluster)  
+
+#create visualization using PC1 and PC2
+fviz_cluster(list(data = pca_df[, 1:2], cluster = cluster_kmeans),
+             geom = "point",
+             ellipse.type = "norm",
+             pointsize = 1) +
+  theme_minimal() +
+  geom_text(aes(label = airport_codes), hjust = 0, vjust = 0, size = 2, check_overlap = TRUE) +
+  scale_fill_brewer(palette = "Paired")
+```
+
+```{r}
+#restore latitude and longitude
+mapping_flights <- final_flights |> 
+  left_join(airport_locations, by = "airport_code")
+
+#create a clustered data frame with airport codes
+clustered_data <- pca_df |> 
+  mutate(cluster = cluster_kmeans,  # Add cluster assignments
+         airport_code = mapping_flights$airport_code)  # Reattach airport codes
+
+#merge clusters into mapping data
+mapping_flights <- mapping_flights |> 
+  left_join(clustered_data |> dplyr::select(airport_code, cluster) |> distinct(), 
+            by = "airport_code")
+
+#filter for U.S. airports 
+us_airports <- mapping_flights |> 
+  filter(longitude > -130, longitude < -60, latitude > 20, latitude < 55)
+
+#create a color palette
+pal <- colorFactor(palette = c("orange", "green", "blue"), domain = us_airports$cluster)
+
+#create a map
+leaflet(us_airports) |> 
+  addProviderTiles("CartoDB.Positron") |>  
+  addCircleMarkers(
+    lng = ~longitude, lat = ~latitude,
+    color = ~pal(cluster),  
+    radius = 5,
+    label = ~airport_code,  
+    fillOpacity = 0.8
+  ) |> 
+  addLegend(
+    "bottomright", pal = pal, values = ~cluster,
+    title = "K-Means Clusters",
+    opacity = 1
+  ) |>
+  setView(lng = -98, lat = 39.5, zoom = 4) |>
+  fitBounds(
+    lng1 = -125, lat1 = 25,  
+    lng2 = -65, lat2 = 50    
+  )
+```
+
+### Hierarchical clustering
+
+Next I will focus on hierarchical clustering, which is another clustering technique to group similar observations. This method organizes the data in a hierarchical structure, allowing us to explore potential hierarchical relationships within the data.
+
+When using hierarchical clustering, it is essential to test different distance metrics and linkage methods to find the best clustering approach. I will try Euclidean and Manhattan distances since they are standard and reliable for numeric data. For linkage, I will try complete, average, and Ward’s.
+
+```{r, warning=FALSE}
+#scale data
+flights_scaled <- scale(flights_numeric)
+
+#compute euclidean distance
+d_euclidean <- dist(flights_scaled, method = "euclidean")
+d_manhattan <- dist(flights_scaled, method = "manhattan")
+
+#apply clustering using different linkage methods
+#euclidean distance
+hc_euclidean_complete <- hclust(d_euclidean, method = "complete")
+hc_euclidean_average <- hclust(d_euclidean, method = "average")
+hc_euclidean_ward <- hclust(d_euclidean, method = "ward.D2")
+
+#manhattan distance
+hc_manhattan_complete <- hclust(d_manhattan, method = "complete")
+hc_manhattan_average <- hclust(d_manhattan, method = "average")
+hc_manhattan_ward <- hclust(d_manhattan, method = "ward.D2")
+
+#TEMPORARILY set k=5, just to color the dendrograms
+k <- 5  #adjust as needed
+
+#create dendrogram plots
+d1 <- fviz_dend(hc_euclidean_complete, k = k, rect = TRUE, rect_fill = TRUE, show_labels = FALSE, main = "Euclidean + Complete")
+d2 <- fviz_dend(hc_euclidean_average, k = k, rect = TRUE, rect_fill = TRUE, show_labels = FALSE, main = "Euclidean + Average")
+d3 <- fviz_dend(hc_euclidean_ward, k = k, rect = TRUE, rect_fill = TRUE, show_labels = FALSE, main = "Euclidean + Ward")
+d4 <- fviz_dend(hc_manhattan_complete, k = k, rect = TRUE, rect_fill = TRUE, show_labels = FALSE, main = "Manhattan + Complete")
+d5 <- fviz_dend(hc_manhattan_average, k = k, rect = TRUE, rect_fill = TRUE, show_labels = FALSE, main = "Manhattan + Average")
+d6 <- fviz_dend(hc_manhattan_ward, k = k, rect = TRUE, rect_fill = TRUE, show_labels = FALSE, main = "Manhattan + Ward")
+
+#arrange plots
+grid.arrange(d1, d2, d3, d4, d5, d6, ncol = 3)
+```
+
+Based on the dendogram plots above, Euclidean + Ward and Manhattan + Ward produce the clearest results. I will compare these combinations by looking at how well the clusters are separated. Manhattan distance with Ward's method performs better because it creates three clusters with notably higher silhouette scores (0.18, 0.25, and 0.22 compared to 0.12, 0.16, and 0.20), indicating stronger, more distinct groupings. Though one cluster has a poor 0.00 score, suggesting points that sit right between clusters, the superior quality of the other groupings outweighs this weakness when considering the overall clustering effectiveness.
+
+```{r}
+#compute silhouette scores for best linkage (Ward’s)
+sil_euclidean_ward <- silhouette(cutree(hc_euclidean_ward, k), d_euclidean)
+sil_manhattan_ward <- silhouette(cutree(hc_manhattan_ward, k), d_manhattan)
+
+#visualize silhouette scores
+s1 <- fviz_silhouette(sil_euclidean_ward) + ggtitle("Euclidean + Ward")
+s2 <- fviz_silhouette(sil_manhattan_ward) + ggtitle("Manhattan + Ward")
+
+#arrange plots
+grid.arrange(s1, s2, ncol = 2)
+```
+
+Next I will test the best number of clusters. The average Silhouette of k = 3 is the largest, so this is likely the best number of clusters.
+
+```{r}
+#test average silhouette
+for (k_test in 3:5) {
+  clusters_hc <- cutree(hc_manhattan_ward, k = k_test)
+  sil <- silhouette(clusters_hc, d_manhattan)
+  avg_sil <- mean(sil[, "sil_width"])
+  cat("k =", k_test, " --> Avg Silhouette =", round(avg_sil, 3), "\n")
+}
+```
+
+Here is the final dendogram with 3 clusters, using Manhattan distance and Ward linkage.
+
+```{r}
+#use final k=3
+final_clusters_hc <- cutree(hc_manhattan_ward, k = 3)
+
+#visualize final dendrogram with k=5
+fviz_dend(hc_manhattan_ward, 
+          k = 3,
+          rect = TRUE, rect_fill = TRUE,
+          main = "Final Hierarchical Clustering (Manhattan + Ward, k=3)")
+```
+
+### Heirarchical clustering visualizations
+
+I chose to visualize my hierarchical clustering analysis using three complementary graphs to reveal the natural groupings in airport characteristics across the United States. I first created a phylogenetic tree displays the evolutionary relationships between airports, showing how they branch into three distinct clusters based on their operational similarities. It is also much clearer to read than the above dendogram. 
+
+```{r}
+#convert PCA results into a data frame
+pca_df <- as.data.frame(pca$x)
+
+#assign airport codes as row names
+if (length(airport_codes) == nrow(pca_df)) {
+  rownames(pca_df) <- airport_codes
+} else {
+  stop("Length of airport_codes does not match the number of rows in pca_df")
+}
+
+#ensure hierarchical clustering object retains airport codes as labels
+hc_manhattan_ward$labels <- rownames(pca_df)
+
+#phylogenetic tree
+fviz_dend(x = hc_manhattan_ward, 
+            k = 3,  # 3 clusters
+            color_labels_by_k = TRUE, 
+            cex = 0.8, 
+            type = "phylogenic", 
+            repel = TRUE,
+            show_labels = TRUE) +  
+  labs(title = "Phylogenetic Tree of Airports") + 
+  theme(axis.text.x = element_text(size = 6), axis.text.y = element_blank())  
+```
+
+Next, I used the same two graph types as for K-means in order to visually compare these methods. At a first look, the clusters look pretty similar in terms of geographic distribution and overall patterns, but I will explore this more in the next section.
+
+```{r}
+#cluster plot
+fviz_cluster(list(data = pca_df[, 1:2], cluster = final_clusters_hc),
+             geom = "point",
+             ellipse.type = "norm",
+             pointsize = 1) +
+  theme_minimal() +
+  geom_text(aes(label = airport_codes), hjust = 0, vjust = 0, size = 2, check_overlap = TRUE) +
+  scale_fill_brewer(palette = "Paired")
+```
+
+```{r}
+#create a new column with remapped hierarchical clusters to match k-means numbering
+clustered_data <- pca_df |> 
+  mutate(
+    hcluster = final_clusters_hc,
+    # Remap cluster numbers to match K-means cluster numbering
+    hcluster_remapped = case_when(
+      final_clusters_hc == 1 ~ 1,
+      final_clusters_hc == 2 ~ 3, 
+      final_clusters_hc == 3 ~ 2
+    ),
+    airport_code = mapping_flights$airport_code
+  )
+
+#merge clusters into mapping data
+mapping_flights <- mapping_flights |> 
+  left_join(clustered_data |> dplyr::select(airport_code, hcluster_remapped) |> distinct(), 
+            by = "airport_code")
+
+#filter for U.S. airports 
+us_airports <- mapping_flights |> 
+  filter(longitude > -130, longitude < -60, latitude > 20, latitude < 55)
+
+#create a color palette for clusters - use the SAME colors as in your K-means visualization
+pal <- colorFactor(palette = c("orange", "green", "blue"), domain = c(1, 2, 3))
+
+#create a map
+leaflet(us_airports) |> 
+  addProviderTiles("CartoDB.Positron") |>  
+  addCircleMarkers(
+    lng = ~longitude, lat = ~latitude,
+    color = ~pal(hcluster_remapped),  
+    radius = 5,
+    label = ~airport_code,  
+    fillOpacity = 0.8
+  ) |> 
+  addLegend(
+    "bottomright", pal = pal, values = ~hcluster_remapped,
+    title = "Hierarchical Clusters",
+    opacity = 1
+  ) |>
+  setView(lng = -98, lat = 39.5, zoom = 4) |>
+  fitBounds(
+    lng1 = -125, lat1 = 25,  
+    lng2 = -65, lat2 = 50    
+  )
+```
+
+### Comparing K-means and hierarchical clusters
+
+First, let’s see how K-Means and Hierarchical Clustering compare in their assignments. K-Means Cluster 1 mostly overlaps with Hierarchical Cluster 1 (155 points), while K-Means Cluster 2 is split between Hierarchical Clusters 1 and 2. K-Means Cluster 3 is the most dispersed but primarily aligns with Hierarchical Cluster 3.
+
+```{r}
+table(fit_km_3$cluster, final_clusters_hc)
+```
+
+Now, let’s look into why these distributions are different. Overall, hierarchical seems to follow the same general pattern as our earlier K-means clusters (snowy-high altitude airports, warm and temperate airports, large airports). However, K-Means creates more distinct and extreme feature values in each cluster, emphasizing stronger separation. In contrast, Hierarchical Clustering preserves more gradual variations, leading to less extreme but more structured clusters.
+
+```{r}
+
+#scale numeric features and remove cluster labels
+flights_scaled <- scale(flights_numeric)
+flights_scaled_clean <- flights_scaled[, !colnames(flights_scaled) %in% c("kmeans_cluster", "hierarchical_cluster")]
+
+#K-Means clustering
+set.seed(123)  
+k <- 3  
+fit_km_3 <- kmeans(flights_scaled_clean, centers = k, nstart = 1000)
+kmeans_centers <- fit_km_3$centers  
+
+#hierarchical clustering
+hc_manhattan_ward <- hclust(dist(flights_scaled_clean, method = "manhattan"), method = "ward.D2")
+final_clusters_hc <- cutree(hc_manhattan_ward, k = k)
+
+#compute mean feature values for hierarchical clusters
+hc_centers <- aggregate(flights_scaled_clean, by = list(final_clusters_hc), mean)[, -1]  
+hc_centers <- as.matrix(hc_centers) 
+
+#create bar plots for K-Means and hierarchical clusters
+par(mfrow = c(2, k))  
+
+for (i in 1:k) {
+  barplot(as.numeric(kmeans_centers[i, ]),  
+          main = paste("K-Means Cluster", i), 
+          las = 2, col = ifelse(kmeans_centers[i, ] > 0, "blue", "red"),
+          ylim = range(kmeans_centers),
+          names.arg = colnames(kmeans_centers), cex.names = 0.7)
+}
+
+for (i in 1:k) {
+  barplot(as.numeric(hc_centers[i, ]),  
+          main = paste("Hierarchical Cluster", i), 
+          las = 2, col = ifelse(hc_centers[i, ] > 0, "blue", "red"),
+          ylim = range(hc_centers),
+          names.arg = colnames(hc_centers), cex.names = 0.7)
+}
+
+par(mfrow = c(1, 1))  
+```
+
+Overall, I prefer K-Means because the well-separated clusters are easier to interpret and compare across groups. However, Hierarchical Clustering may be better if the goal is to capture underlying relationships and gradual transitions between data points. Below is a 3D graph that visualizes these distinct K-Means clusters, clearly highlighting the minimal overlap between them.This shows how K-Means effectively differentiates airports with minimal overlap, making patterns in the data more apparent.
+
+```{r}
+#convert PCA results to a data frame
+pca_df <- as.data.frame(pca$x[, 1:3])  
+
+#add cluster labels and airport names
+pca_df$Cluster <- as.factor(fit_km_3$cluster)  
+pca_df$Airport <- airport_codes
+
+#function to create ellipsoid for each cluster
+create_ellipsoid <- function(data, cluster_id, level = 0.95) {
+  cluster_data <- data[data$Cluster == cluster_id, c("PC1", "PC2", "PC3")]
+  mean_values <- colMeans(cluster_data)
+  cov_matrix <- cov(cluster_data)
+  theta <- seq(0, 2*pi, length.out = 25)
+  phi <- seq(0, pi, length.out = 25)
+  x_unit <- outer(cos(theta), sin(phi))
+  y_unit <- outer(sin(theta), sin(phi))
+  z_unit <- outer(rep(1, length(theta)), cos(phi))
+  eigen_decomp <- eigen(cov_matrix)
+  scale_factor <- sqrt(qchisq(level, df = 3))
+  radius <- scale_factor * sqrt(eigen_decomp$values)
+  x_ellipsoid <- matrix(0, nrow = length(theta), ncol = length(phi))
+  y_ellipsoid <- matrix(0, nrow = length(theta), ncol = length(phi))
+  z_ellipsoid <- matrix(0, nrow = length(theta), ncol = length(phi))
+  
+  for (i in 1:length(theta)) {
+    for (j in 1:length(phi)) {
+      vec <- c(x_unit[i,j], y_unit[i,j], z_unit[i,j])
+      transformed <- eigen_decomp$vectors %*% diag(radius) %*% vec + mean_values
+      x_ellipsoid[i,j] <- transformed[1]
+      y_ellipsoid[i,j] <- transformed[2]
+      z_ellipsoid[i,j] <- transformed[3]
+    }
+  }
+  
+  return(list(x = x_ellipsoid, y = y_ellipsoid, z = z_ellipsoid))
+}
+
+#get unique clusters
+clusters <- unique(pca_df$Cluster)
+
+#create a consistent color palette
+cluster_colors <- c(
+  "#1f77b4",  
+  "#ff7f0e",  
+  "#2ca02c"
+)
+
+#create base plot
+plot_3D <- plot_ly() %>%
+  layout(title = "3D Cluster Plot",
+         scene = list(xaxis = list(title = "PC1"),
+                      yaxis = list(title = "PC2"),
+                      zaxis = list(title = "PC3")))
+
+#add labels and ellipsoids 
+for (i in seq_along(clusters)) {
+  cluster_id <- clusters[i]
+  color <- cluster_colors[i]
+  
+  #get data for this cluster
+  cluster_data <- pca_df[pca_df$Cluster == cluster_id, ]
+  
+  #add text markers
+  plot_3D <- plot_3D %>% add_trace(
+    data = cluster_data,
+    x = ~PC1, 
+    y = ~PC2, 
+    z = ~PC3, 
+    type = "scatter3d", 
+    mode = "text",  
+    text = ~Airport,
+    textfont = list(
+      size = 10,
+      color = color
+    ),
+    name = paste("Cluster", cluster_id),
+    hoverinfo = "text",
+    showlegend = TRUE
+  )
+  
+  #create and add ellipsoid surface for this cluster
+  ellipsoid <- create_ellipsoid(pca_df, cluster_id, level = 0.80)
+  
+  #add ellipsoid with consistent color and transparency
+  plot_3D <- plot_3D %>% add_trace(
+    x = ellipsoid$x,
+    y = ellipsoid$y,
+    z = ellipsoid$z,
+    type = "surface",
+    opacity = 0.15,  
+    colorscale = list(c(0, 1), c(color, color)),  
+    showscale = FALSE,
+    name = paste("Ellipsoid", cluster_id),
+    hoverinfo = "none",
+    showlegend = FALSE
+  )
+}
+plot_3D
+```
+
+## Conclusions
+
+This unsupervised learning analysis identified distinct patterns and natural groupings among U.S. airports using PCA and clustering techniques. PCA extracted several principal components, with the first four capturing 66% of total variance. While additional components contribute to the remaining variation, this study focused on the first four as they represent the most interpretable patterns:
+
+-   **Airport size and traffic volume (PC1):** Differentiates large hub airports with high passenger traffic, long runways, and frequent congestion from smaller regional airports.
+
+-   **Climate and geography (PC2):** Separates warm airports from colder, high-altitude locations, reflecting how geography influences operations.
+
+-   **Delay cause patterns (PC3):** Identifies whether delays stem from operational constraints like air traffic control or external environmental factors.
+
+-   **Precipitation levels (PC4):** Captures extreme rainfall or snowfall as a distinct factor affecting airport conditions.
+
+The clustering analysis using K-Means and Hierarchical Clustering further refines these insights by grouping airports into three distinct categories:
+
+-   **Snowy, high-altitude airports:** Airports at higher elevations experiencing significant weather delays, wide temperature ranges, and substantial snowfall.
+
+-   **Large, high-volume airports:** Busy airports with high flight volumes, large budgets, and extensive infrastructure.
+
+-   **Warm-weather airports:** Airports characterized by high temperatures year-round with little temperature fluctuation or snowfall.
+
+While both methods produced similar clusters, K-Means created more clearly separated groups, making distinctions between airport types more interpretable. Hierarchical Clustering, in contrast, preserved gradual variations, reflecting underlying relationships between features.
+
+These findings offer a data-driven framework for decision-making in airport management, policy, and airline operations. Airport authorities can use this classification to optimize infrastructure investments and air traffic management based on airport type, while airlines can adjust flight scheduling and route planning for better operational efficiency. Transportation planners can leverage these insights to improve regional air connectivity and network performance.
+
+While this study provides a foundation for understanding the structure of U.S. airports, future research could explore additional principal components, track how airport clusters evolve over time, and extend the analysis to international airport systems to examine regulatory and infrastructure differences.
+
+
+## Bibliography
+
+-   Bureau of Transportation Statistics. (n.d.). *On-time performance and delay causes.* U.S. Department of Transportation. Retrieved from <https://www.transtats.bts.gov/ot_delay/OT_DelayCause1.asp?20=E>
+
+-   Federal Aviation Administration. (n.d.-a). *Passenger boarding (enplanement) and all-cargo data.* U.S. Department of Transportation. Retrieved from <https://www.faa.gov/airports/planning_capacity/passenger_allcargo_stats/passenger>
+
+-   Federal Aviation Administration. (n.d.-b). *National plan of integrated airport systems (NPIAS) – Historical data.* U.S. Department of Transportation. Retrieved from <https://www.faa.gov/airports/planning_capacity/npias/current/historical>
+
+-   OpenFlights. (n.d.). *Global airport database.* Retrieved from <https://github.com/jpatokal/openflights/blob/master/data/airports.dat>
+
+-   Open-Meteo. (n.d.). *Weather data API.* Retrieved from <https://open-meteo.com/>
+
+-   OurAirports. (n.d.). *Worldwide airport and aviation data.* Retrieved from <https://ourairports.com/data/>

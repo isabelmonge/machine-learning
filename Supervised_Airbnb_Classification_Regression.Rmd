@@ -1,0 +1,1383 @@
+---
+title: "Advanced Modelling Final"
+author: "Isabel Monge"
+output: html_document
+date: "2025-03-20"
+---
+
+## Introduction
+
+This exercise explores both classification and regression problems, applying a range of models to predict Airbnb superhost status (classification) and nightly prices (regression). The goal is to compare different approaches, from traditional statistical methods to machine learning models, to understand their strengths and weaknesses in different descriptive and predictive tasks.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message=FALSE}
+library(tidyverse)
+library(dplyr)
+library(readr)
+library(lubridate)
+library(DataExplorer)
+library(mice)   
+library(leaflet)
+library(corrplot)       
+library(GGally)         
+library(gridExtra)
+library(caret)
+library(ggplot2)
+library(ggeffects)
+library(rpart)
+library(rpart.plot)
+library(pROC)    
+library(pdp)
+library(xgboost)
+library(olsrr)
+
+#for reproduceability
+set.seed(123)
+```
+
+## Data Cleaning & Processing
+
+#### Data Selection & Cleaning
+
+I will start by loading the data.
+
+```{r, message=FALSE}
+airbnb_data <- read_csv("listings.csv")
+```
+
+Next I will select the most useful columns for my analysis.
+
+```{r}
+# select relevant columns for analysis
+airbnb_reduced <- airbnb_data |> 
+  dplyr::select(
+    
+    # target variables
+    host_is_superhost,       # classification target
+    price,                   # regression target
+    
+    # location
+    neighbourhood_cleansed,  
+    latitude,
+    longitude,
+    
+    # property characteristics
+    room_type,
+    accommodates,
+    bathrooms,
+    bedrooms,
+    beds,
+    
+    # host attributes
+    host_response_time,
+    host_response_rate,
+    host_acceptance_rate,
+    host_identity_verified,
+    host_has_profile_pic,
+    host_since,
+    host_listings_count,
+    
+    # review metrics
+    review_scores_rating,
+    review_scores_cleanliness,
+    review_scores_checkin,
+    review_scores_communication,
+    review_scores_location,
+    review_scores_value,
+    number_of_reviews,
+    
+    # availability and booking policies
+    minimum_nights,
+    maximum_nights,
+    availability_365,
+    instant_bookable
+    )
+```
+
+Then I will clean and preprocess the variables, converting variables to numeric or factor data where necessary.
+
+```{r, warning=FALSE}
+# clean and preprocess variables
+airbnb_clean <- airbnb_reduced |> 
+  mutate(
+    # convert price from string to numeric (remove $ and commas)
+    price = as.numeric(gsub("[\\$,]", "", price)),
+    
+    # convert categorical variables to factors as specified
+    neighbourhood_cleansed = factor(neighbourhood_cleansed),
+    room_type = factor(room_type),
+    
+    # convert response time to ordered factor
+    host_response_time = factor(host_response_time, 
+                              levels = c("within an hour", "within a few hours", 
+                                         "within a day", "a few days or more")),
+    
+    # convert rates from percentage strings to numeric as requested
+    host_response_rate = as.numeric(gsub("[\\%]", "", host_response_rate)) / 100,
+    host_acceptance_rate = as.numeric(gsub("[\\%]", "", host_acceptance_rate)) / 100,
+    
+    # convert logical variables to factors (NA values stay as NA)
+    host_is_superhost = factor(host_is_superhost, levels = c(FALSE, TRUE), labels = c("No", "Yes")),
+    host_identity_verified = factor(host_identity_verified, levels = c(FALSE, TRUE), labels = c("No", "Yes")),
+    host_has_profile_pic = factor(host_has_profile_pic, levels = c(FALSE, TRUE), labels = c("No", "Yes")),
+    instant_bookable = factor(instant_bookable, levels = c(FALSE, TRUE), labels = c("No", "Yes")),
+    
+    # convert host_since to days from today as requested
+    host_since = as.Date(host_since),
+    host_tenure_days = as.numeric(difftime(Sys.Date(), host_since, units = "days")),
+    
+    # cap maximum nights at 365 (as per airbnb policy)
+    maximum_nights = pmin(maximum_nights, 365),
+    minimum_nights = pmin(minimum_nights, 365)
+  )
+  
+# remove the original host_since column as we now have host_tenure_days
+airbnb_clean <- airbnb_clean |>
+  dplyr::select(-host_since)
+
+# check the data structure and types
+str(airbnb_clean)
+```
+
+#### Handling Missing Data
+
+```{r}
+plot_intro(airbnb_clean)
+
+#non-numeric variables
+names(airbnb_clean)[!sapply(airbnb_clean, is.numeric)]
+```
+
+I can see that there quite a few rows with missing observations, so I will impute with MICE.
+
+```{r}
+
+pred_matrix <- make.predictorMatrix(airbnb_clean)
+
+imputation_methods <- make.method(airbnb_clean)
+# use PMM for all numeric variables
+imputation_methods[c("price", "accommodates", "bathrooms", "bedrooms", "beds", 
+                    "host_response_rate", "host_acceptance_rate", "host_listings_count",
+                    "review_scores_rating", "review_scores_cleanliness", "review_scores_checkin", 
+                    "review_scores_communication", "review_scores_location", "review_scores_value",
+                    "number_of_reviews", "minimum_nights", "maximum_nights", 
+                    "availability_365", "host_tenure_days")] <- "pmm"
+
+# run MICE with explicit methods
+mice_mod <- mice(airbnb_clean, m = 4, seed = 123, method = imputation_methods, 
+                predictorMatrix = pred_matrix, print = FALSE)
+
+# get the completed dataset
+airbnb_clean <- complete(mice_mod, 1)
+
+# check types after imputation
+str(airbnb_clean$price)
+```
+
+Now I have a clean dataset that is ready for analysis.
+
+## EDA
+
+#### Visualizing Target Variables
+
+I will use `host_is_superhost` (T/F) as my classification target and `price` as my regression target.
+
+```{r, warning=FALSE}
+# simple visualization of superhost status (classification target)
+ggplot(airbnb_clean, aes(x = host_is_superhost, fill = host_is_superhost)) +
+  geom_bar() +
+  labs(title = "Distribution of Superhost Status") +
+  theme_minimal()
+
+# simple visualization of price distribution (regression target)
+ggplot(airbnb_clean, aes(x = price)) +
+  geom_histogram(fill = "steelblue", bins = 50) +
+  scale_x_continuous(limits = c(0, 500)) +
+  labs(title = "Distribution of Airbnb Listing Prices",
+       x = "Price ($)",
+       y = "Count") +
+  theme_minimal()
+
+# relationship between target variables (price by superhost status)
+ggplot(airbnb_clean, aes(x = host_is_superhost, y = price, fill = host_is_superhost)) +
+  geom_boxplot() +
+  scale_y_continuous(limits = c(0, 500)) +
+  labs(title = "Price by Superhost Status") +
+  theme_minimal()
+```
+
+I can see the classification target is fairly balanced, with about 4500 "No" and 3300 "Yes" instances. Price is right skewed, with many prices falling around \$100/night. While the median price is nearly identical for Superhosts and non-Superhosts, Superhosts have more high-end outliers, suggesting a higher number of premium-priced listings.
+
+#### Numeric Variable Distributions
+
+```{r}
+#plot histograms
+df_long <- airbnb_clean |> 
+  dplyr::select(where(is.numeric)) |> 
+  pivot_longer(cols = everything(), names_to = "feature", values_to = "value")
+
+ggplot(df_long, aes(x = value)) +
+  geom_histogram(bins = 30, fill = "steelblue", alpha = 0.7) +
+  facet_wrap(~feature, scales = "free") +
+  theme_minimal() +
+  labs(title = "Distribution of Numeric Features")
+```
+
+#### Log Transformations for Linear Models
+
+```{r}
+# create a transformed version of the dataset for models that need it
+airbnb_final <- airbnb_clean |> 
+  mutate(
+    # log transformations for heavily skewed variables
+    host_listings_count_log = log1p(host_listings_count),
+    number_of_reviews_log = log1p(number_of_reviews),
+    minimum_nights_log = log1p(minimum_nights),
+    maximum_nights_log = log1p(maximum_nights),
+    # I will also add some interactions here
+    coords_squared = latitude^2 + longitude^2,
+    coords_mult = latitude * longitude
+  )
+```
+
+I applied log transformations to heavily right-skewed variables (host_listings_count, number_of_reviews, minimum_nights, maximum_nights) to normalize their distributions, which benefits linear models and distance-based algorithms.
+
+#### Geographic Variables
+
+I will also visualize the relationship between geographic variables (latitude and longitude) and my regression target, price.
+
+```{r}
+# cap price at $500
+airbnb_final$price_capped <- pmin(airbnb_final$price, 500)
+
+# create a color palette based on the capped price
+color_pal <- colorNumeric(palette = "RdYlBu", domain = airbnb_final$price_capped, reverse = TRUE)
+
+# create a map showing price distribution with capped prices
+map <- leaflet(airbnb_final) |> 
+  addProviderTiles(providers$CartoDB.Positron) |> 
+  setView(lng = median(airbnb_final$longitude, na.rm = TRUE), 
+          lat = median(airbnb_final$latitude, na.rm = TRUE), 
+          zoom = 12) |> 
+  addCircles(
+    lng = ~longitude, 
+    lat = ~latitude,
+    radius = ~sqrt(price_capped)*5,  
+    color = ~color_pal(price_capped), 
+    popup = ~paste(
+      "Price: $", price_capped, "<br>",
+      "Room type: ", room_type, "<br>",
+      "Accommodates: ", accommodates
+    )
+  ) |> 
+  addLegend(position = "bottomright", 
+            pal = color_pal, 
+            values = ~price_capped, 
+            title = "Price ($, capped at 500)")
+map
+```
+
+Higher-priced listings appear to be clustered in specific areas, especially in neighborhoods in the northeastern part of the city, while lower-priced options are more widely dispersed.
+
+#### Correlations
+
+```{r}
+ggcorr(airbnb_clean, label = T)
+```
+
+There is moderate to high correlation between review variables and size variables (accommodates, bathrooms, bedrooms). While this is not a problem for ML/tree-based models, I may need to consider regularization techniques to prevent multicollinearity issues when using linear models.
+
+## Classification (Interpretation)
+
+#### Data Splitting
+
+For model validation, I'm using a 70/30 split between training and testing data. With over 7,700 observations in the dataset, this gives us sufficient data for both training the models and evaluating their performance on unseen data.
+
+```{r}
+
+in_train <- createDataPartition(airbnb_clean$host_is_superhost, p = 0.7, list = FALSE)  # 70% for training, my choice
+training <- airbnb_final[ in_train,]
+testing <- airbnb_final[-in_train,]
+nrow(training)
+nrow(testing)
+```
+
+I've also configured 5-fold cross-validation for model training. Given the dataset size, 5 folds offers a good balance between computational efficiency and validation quality. This approach trains each model on different subsets of the training data, providing more reliable performance estimates than a single train/test split alone.
+
+```{r}
+ctrl <- trainControl(method = "repeatedcv", 
+                     number = 5, #my choice since dataset is somewhat large, if I had more time I would choose 10
+                     classProbs = T,
+                     summaryFunction=twoClassSummary,
+                     verboseIter = F) #will improve html readability
+```
+
+#### Logistic (Binary) Regression
+
+This wouldn't be possible to interpret with 100s of variables, but since I only have 32 I'll run a logistic regression with all variables to identify significant predictors of superhost status.
+
+```{r}
+# train a logistic regression model with all variables
+logit_model <- glm(host_is_superhost ~ ., family = binomial, data = training)
+summary(logit_model)
+```
+
+This model reveals that host responsiveness, acceptance rates, review quality, and property management are the most important predictors of superhost status. I'll include these key variables in a more interpretable model.
+
+```{r}
+# create a more interpretable model with selected variables
+logit_simple <- glm(
+  host_is_superhost ~ host_response_rate + 
+                     host_acceptance_rate + 
+                     review_scores_rating + 
+                     number_of_reviews_log + 
+                     host_listings_count_log + 
+                     availability_365 + 
+                     instant_bookable +
+                     room_type +
+                     minimum_nights_log +
+                     maximum_nights_log,
+  family = binomial, 
+  data = training
+)
+summary(logit_simple)
+
+# calculate odds ratios for easier interpretation
+odds_ratios <- exp(coef(logit_simple))
+odds_ratios_df <- data.frame(
+  Variable = names(odds_ratios),
+  OddsRatio = odds_ratios
+)
+print(odds_ratios_df)
+```
+
+This simplified model reveals clear superhost predictors: responsive communication is paramount, followed by high ratings and acceptance rate. Having more reviews significantly increases superhost probability, while shared rooms reduce chances. Properties with lower availability and without instant booking are more likely to achieve superhost status, suggesting selective, attentive hosting is more effective than maximizing bookings. These results are visualized in the plots below:
+
+```{r}
+# host response rate effect
+gg_response <- ggpredict(logit_simple, terms = "host_response_rate")
+plot(gg_response) + 
+  labs(title = "Effect of Host Response Rate on Superhost Probability",
+       x = "Host Response Rate",
+       y = "Probability of being a Superhost")
+gg_response
+
+# review scores rating effect
+gg_rating <- ggpredict(logit_simple, terms = "review_scores_rating")
+plot(gg_rating) + 
+  labs(title = "Effect of Review Scores Rating on Superhost Probability",
+       x = "Review Scores Rating",
+       y = "Probability of being a Superhost")
+gg_rating
+
+# availability effect
+gg_avail <- ggpredict(logit_simple, terms = "availability_365")
+plot(gg_avail) + 
+  labs(title = "Effect of Availability on Superhost Probability",
+       x = "Days Available per Year",
+       y = "Probability of being a Superhost")
+gg_avail
+
+# number of reviews (log) effect
+gg_reviews <- ggpredict(logit_simple, terms = "number_of_reviews_log")
+plot(gg_reviews) + 
+  labs(title = "Effect of Number of Reviews (log) on Superhost Probability",
+       x = "Log Number of Reviews",
+       y = "Probability of being a Superhost")
+gg_reviews
+```
+
+#### Decision Tree
+
+While decision trees do not have the strongest predictive power, they are useful explanatory tools. Let's try this model and compare the results with the model above.
+
+```{r}
+# create parameters for interpretability
+control = rpart.control(minsplit = 30, cp = 0.02)
+
+#create decision tree
+dt_simple <- rpart(host_is_superhost ~ ., data = training, method = "class", control = control)
+rpart.plot(dt_simple, digits = 3)
+```
+
+The decision tree identifies three key thresholds for achieving superhost status. Listings with fewer than four reviews are unlikely to belong to a superhost. For those with enough reviews, ratings play a crucial role—listings with lower ratings have a reduced likelihood of superhost status. Host acceptance rate also plays a significant role, with higher rates increasing the probability of earning superhost status. These decision rules align with the logistic regression findings and offer actionable benchmarks for Airbnb hosts.
+
+## Classification (Prediction)
+
+#### Benchmark Model
+
+I'm starting with a simple benchmark model to establish a baseline for prediction. This model only uses the overall proportion of superhosts in my training data to make predictions, without considering any listing features.
+
+```{r}
+# create benchmark model
+bench_model = glm(host_is_superhost ~ 1, family = binomial(link = 'logit'), data = training)
+
+# get predictions from benchmark model
+probability = predict(bench_model, newdata = testing, type = "response")
+
+# check probability distribution
+summary(probability)
+
+# create factor predictions
+prediction = factor(ifelse(probability > 0.5, "Yes", "No"), levels = c("No", "Yes"))
+
+# confusion matrix
+confusionMatrix(prediction, testing$host_is_superhost)
+```
+
+The summary shows that my model assigns the exact same probability (0.4156 or 41.56%) to every listing in the test set. This represents the proportion of superhosts in my training data. Since this probability is below the 0.5 threshold, my model predicts "No" for every single observation. This results in an accuracy of 58.44%, which is exactly the percentage of non-superhosts in my test data. While the model correctly identifies all the "No" cases (100% sensitivity), it fails to identify any "Yes" cases (0% specificity), giving a Kappa value of 0.
+
+Now, let's implement models that can actually learn patterns from the data.
+
+### Bayes Classifiers
+
+I will start my classification prediction using three Bayesian classifiers: Linear Discriminant Analysis (LDA), Quadratic Discriminant Analysis (QDA), and Regularized Discriminant Analysis. These models classify data by finding boundaries between groups based on probability distributions. To improve performance, I will use cross-validation and tune RDA with a small grid search to save time.
+
+#### LDA
+
+```{r, warning=FALSE}
+# LDA with limited variables to address collinearity
+ldaFit <- train(host_is_superhost ~ host_response_rate + 
+                     host_acceptance_rate + 
+                     review_scores_rating + 
+                     number_of_reviews_log + 
+                     host_listings_count_log + 
+                     availability_365 + 
+                     instant_bookable +
+                     room_type +
+                     minimum_nights_log +
+                     maximum_nights_log,
+               data = training,
+               method = "lda", 
+               preProcess = c("center", "scale"),
+               metric = "ROC",
+               trControl = ctrl)
+print(ldaFit)
+
+# predict and evaluate
+ldaPred = predict(ldaFit, testing)
+ldaProb = predict(ldaFit, testing, type="prob")[,"Yes"]
+
+# confusion matrix
+confusionMatrix(ldaPred, testing$host_is_superhost)$table
+confusionMatrix(ldaPred, testing$host_is_superhost)$overall[1:2]
+```
+
+#### QDA
+
+```{r}
+# QDA with subset of variables to avoid rank deficiency
+qdaFit <- train(host_is_superhost ~ host_acceptance_rate + 
+                     review_scores_rating + 
+                     number_of_reviews_log + 
+                     host_listings_count_log,
+                data = training,
+                method = "qda", 
+                preProcess = c("center", "scale"),
+                metric = "ROC",
+                trControl = ctrl)
+print(qdaFit)
+
+# predict and evaluate
+qdaPred = predict(qdaFit, testing)
+qdaProb = predict(qdaFit, testing, type="prob")[,"Yes"]
+
+# confusion matrix
+confusionMatrix(qdaPred, testing$host_is_superhost)$table
+confusionMatrix(qdaPred, testing$host_is_superhost)$overall[1:2]
+```
+
+#### RDA
+
+```{r}
+# set parameters
+param_grid = expand.grid(
+  gamma = seq(0, 1, by = 0.2),   
+  lambda = seq(0.1, 0.9, by = 0.2)  
+)
+
+# regularized discriminant analysis (RDA)
+rdaFit <- train(host_is_superhost ~ ., 
+                method = "rda", 
+                data = training,
+                tuneGrid = param_grid,
+                preProcess = c("center", "scale", "nzv"),
+                metric = "ROC", 
+                trControl = ctrl)
+print(rdaFit)
+plot(rdaFit)
+
+# best tuning parameters
+print("Best Parameters:")
+print(rdaFit$bestTune)
+
+# predict and validate
+rdaPred = predict(rdaFit, testing)
+confusionMatrix(rdaPred, testing$host_is_superhost)$table
+confusionMatrix(rdaPred, testing$host_is_superhost)$overall[1:2]
+```
+
+Since this is an Airbnb classification task, not something high-risk like a medical diagnosis, misclassifications don’t have serious consequences. Predicting superhost status incorrectly might affect recommendations or visibility on the platform, but it doesn’t lead to critical errors. Therefore, I think LDA is the best model because it provides the highest accuracy while maintaining a good balance between correctly identifying superhosts and non-superhosts.
+
+### Machine Learning Models
+
+In this section, I apply machine learning models to predict Airbnb superhost status. I test k-Nearest Neighbors (k-NN), Random Forest, eXtreme Gradient Boosting (XGBoost), and Neural Networks, each with different strengths.
+
+-   k-NN classifies hosts based on their closest neighbors but can struggle with high-dimensional data.
+-   Random Forest uses multiple decision trees, making it robust and interpretable.
+-   XGBoost improves on decision trees with boosting, but can be computationally expensive.
+-   Neural Networks capture complex patterns but often require large datasets to perform well.
+
+I will tune each model using a reduced grid search to minimize computation and evaluate them based on accuracy, while also considering sensitivity and specificity.
+
+#### Nearest Neighbors
+
+```{r}
+# reduced tuning grid to minimize computation
+knn_grid <- expand.grid(
+  kmax = c(3, 7, 11),  # odd numbers to break ties
+  distance = 2,  # Euclidean distance
+  kernel = "rectangular"  
+)
+
+# train KNN model 
+knnFit <- train(
+  host_is_superhost ~ ., 
+  data = training,
+  method = "kknn", 
+  preProcess = c("center", "scale", "nzv"),
+  tuneGrid = knn_grid,
+  metric = "ROC", 
+  trControl = ctrl  
+)
+print(knnFit)
+plot(knnFit)
+
+# print best tuning parameters
+best_knn_params <- knnFit$bestTune
+print("Best Parameters:")
+print(best_knn_params)
+
+# make predictions
+knnPred <- predict(knnFit, testing)
+
+# evaluate model performance
+conf_matrix <- confusionMatrix(knnPred, testing$host_is_superhost)
+print(conf_matrix$table)  
+print(conf_matrix$overall[1:2])  
+```
+
+#### Random Forest
+
+```{r}
+# define tuning grid for Random Forest
+rf_grid <- expand.grid(
+  mtry = c(3, 6, 9, 12),  
+  splitrule = "gini",  
+  min.node.size = c(1, 5, 10)  
+)
+
+# train Random Forest Model with Tuning
+rfFit <- train(
+  host_is_superhost ~ ., 
+  data = training,
+  method = "ranger",   
+  preProcess = c("center", "scale", "nzv"),
+  tuneGrid = rf_grid,
+  metric = "ROC",  
+  trControl = ctrl
+)
+print(rfFit)
+plot(rfFit)
+
+# best tuning parameters
+best_rf_params <- rfFit$bestTune
+print("Best Parameters:")
+print(best_rf_params)
+
+# make predictions
+rfPred <- predict(rfFit, testing)
+
+# evaluate model performance
+conf_matrix <- confusionMatrix(rfPred, testing$host_is_superhost)
+print(conf_matrix$table)  
+print(conf_matrix$overall[1:2])  
+```
+
+#### Gradient Boosting
+
+```{r, warning=FALSE}
+# define tuning grid for Gradient Boosting
+gbm_grid <- expand.grid(
+  nrounds = c(50, 100),  # Reduced boosting iterations
+  max_depth = c(3, 6),  # Smaller range of tree depths
+  eta = c(0.1, 0.3),  # Only 2 learning rate values
+  gamma = 0,  # Fixed (removes unnecessary tuning)
+  colsample_bytree = 0.8,  # Fixed (removes unnecessary tuning)
+  min_child_weight = 1,  # Default (prevents overfitting)
+  subsample = 0.8  # Default 
+)
+
+# train XGBoost model with warning suppression
+invisible(
+  capture.output(
+    gbmFit <- train(
+      host_is_superhost ~ ., 
+      data = training,
+      method = "xgbTree",   
+      preProcess = c("center", "scale", "nzv"),
+      tuneGrid = gbm_grid,
+      metric = "ROC",  
+      trControl = ctrl,
+      verbose = FALSE
+    )
+  )
+)
+print(gbmFit)
+plot(gbmFit)
+
+# best tuning parameters
+best_gbm_params <- gbmFit$bestTune
+print("Best Parameters:")
+print(best_gbm_params)
+
+# make predictions
+gbmPred <- predict(gbmFit, testing)
+
+# evaluate model performance
+conf_matrix <- confusionMatrix(gbmPred, testing$host_is_superhost)
+print(conf_matrix$table)  # Confusion matrix
+print(conf_matrix$overall[1:2])  # Accuracy & Kappa
+```
+
+#### Neural Networks
+
+```{r}
+# define grid for Neural Networks
+nn_grid <- expand.grid(
+  size = c(2, 4, 6),  
+  decay = c(0.001, 0.01, 0.1)  
+)
+
+# train Neural Network 
+invisible(
+  capture.output(
+    nnFit <- train(
+      host_is_superhost ~ ., 
+      data = training,
+      method = "nnet",  
+      preProcess = c("center", "scale", "nzv"),
+      trControl = ctrl,
+      tuneGrid = nn_grid,
+      metric = "ROC",
+      trace = FALSE,  
+      maxit = 100  # reduce iterations for faster training
+    )
+  )
+)
+print(nnFit)
+plot(nnFit)
+
+# best tuning parameters
+best_nn_params <- nnFit$bestTune
+print("Best Parameters:")
+print(best_nn_params)
+
+# make predictions
+nnPred <- predict(nnFit, testing)
+
+# evaluate model performance
+conf_matrix <- confusionMatrix(nnPred, testing$host_is_superhost)
+print(conf_matrix$table)  
+print(conf_matrix$overall[1:2])  
+```
+
+Gradient boosting provided the best accuracy and predictive power of the ML models, making it the most effective model for this task. Random Forest was not quite as accurate, but was a close second and was able to run more quickly. Neural Networks performed decently well, but not as well as Gradient Boosting and Random Forest. This makes sense since deep learning models are generally not well-suited for tabular data, and reinforces that tree-based models often work best for structured datasets.
+
+### Comparing Models
+
+Now lets compare all 7 of the Bayes classification models and ML models against one another.
+
+```{r, message=FALSE}
+# model Comparison
+# get probabilities for each model
+ldaProb = predict(ldaFit, testing, type="prob")[,"Yes"]
+qdaProb = predict(qdaFit, testing, type="prob")[,"Yes"]
+rdaProb = predict(rdaFit, testing, type="prob")[,"Yes"]
+knnProb = predict(knnFit, testing, type="prob")[,"Yes"]
+rfProb = predict(rfFit, testing, type="prob")[,"Yes"]
+gbmProb = predict(gbmFit, testing, type="prob")[,"Yes"]
+nnProb = predict(nnFit, testing, type="prob")[,"Yes"]
+
+# Calculate ROC curves
+library(pROC)
+roc_lda = roc(testing$host_is_superhost == "Yes" ~ ldaProb)
+roc_qda = roc(testing$host_is_superhost == "Yes" ~ qdaProb)
+roc_rda = roc(testing$host_is_superhost == "Yes" ~ rdaProb)
+roc_knn = roc(testing$host_is_superhost == "Yes" ~ knnProb)
+roc_rf = roc(testing$host_is_superhost == "Yes" ~ rfProb)
+roc_gbm = roc(testing$host_is_superhost == "Yes" ~ gbmProb)
+roc_nn = roc(testing$host_is_superhost == "Yes" ~ nnProb)
+
+# Plot ROC curves
+plot(roc_lda, col="darkgreen", main="ROC Curves for Different Models")
+plot(roc_qda, col="orange", add=TRUE)
+plot(roc_rda, col="blue", add=TRUE)
+plot(roc_knn, col="red", add=TRUE)
+plot(roc_rf, col="green", add=TRUE)
+plot(roc_gbm, col="purple", add=TRUE)
+plot(roc_nn, col="brown", add=TRUE)
+legend("bottomright", 
+       legend=c("LDA", "QDA", "RDA", "KNN", "RF", "GBM", "NN"), 
+       col=c("darkgreen", "orange", "blue", "red", "green", "purple", "brown"), 
+       lwd=2)
+
+# compare AUC values
+auc_values <- data.frame(
+  Model = c("LDA", "QDA", "RDA", "KNN", "RF", "GBM", "NN"),
+  AUC = c(roc_lda$auc, roc_qda$auc, roc_rda$auc, roc_knn$auc, roc_rf$auc, roc_gbm$auc, roc_nn$auc)
+)
+auc_values <- auc_values[order(-auc_values$AUC),]
+print(auc_values)
+
+# variable importance for best model (Gradient Boosting)
+gbm_imp <- varImp(gbmFit, scale = FALSE)
+plot(gbm_imp, top = 15, main = "Top 15 Most Important Variables (GBM)")
+
+# get top variables from importance plot
+important_vars <- rownames(gbm_imp$importance)[order(-gbm_imp$importance[,1])][1:3]
+
+# create partial dependence plots for all top variables
+for(var in important_vars) {
+  pdp_plot <- partial(gbmFit, pred.var = var, which.class = 2, plot = TRUE, 
+                      prob = TRUE, rug = TRUE)
+  print(pdp_plot)
+}  
+```
+
+The ROC curve and AUC scores confirm that Gradient Boosting performed the best, achieving the highest AUC, followed by Random Forest. These models were the most effective at distinguishing superhosts from non-superhosts. Overall, the ML models performed better than the Bayesian Classifiers.
+
+The feature importance plot for Gradient Boosting, the top performing model, shows that number of reviews, host listing count, and acceptance rate are the most influential factors in predicting superhost status. The partial dependence plots suggest that hosts with more reviews and higher acceptance rates are more likely to be superhosts, while hosts with an extremely high number of listings may be less likely. These findings align with those we saw earlier in the simple linear model and decision tree.
+
+### Threshold Optimization for Best Model
+
+Next I will adjust the classification threshold for the best performing model, Gradient Boosting, to see how different probability cutoffs affect accuracy and the balance between false positives and false negatives. This helps determine the optimal threshold that best distinguishes superhosts from non-superhosts while minimizing misclassification errors.
+
+```{r}
+#threshold Optimization
+threshold = 0.3  
+gbmProb = predict(gbmFit, testing, type="prob")
+gbm_adjusted_pred <- as.factor(ifelse(gbmProb[,"Yes"] > threshold, "Yes", "No"))
+
+# check confusion matrix with adjusted threshold
+print(paste("GBM with threshold =", threshold))
+confusionMatrix(gbm_adjusted_pred, testing$host_is_superhost)$table
+confusionMatrix(gbm_adjusted_pred, testing$host_is_superhost)$overall[1:2]
+
+#threshold Optimization
+threshold = 0.4  
+gbmProb = predict(gbmFit, testing, type="prob")
+gbm_adjusted_pred <- as.factor(ifelse(gbmProb[,"Yes"] > threshold, "Yes", "No"))
+
+# check confusion matrix with adjusted threshold
+print(paste("GBM with threshold =", threshold))
+confusionMatrix(gbm_adjusted_pred, testing$host_is_superhost)$table
+confusionMatrix(gbm_adjusted_pred, testing$host_is_superhost)$overall[1:2]
+
+#threshold Optimization
+threshold = 0.5  
+gbmProb = predict(gbmFit, testing, type="prob")
+gbm_adjusted_pred <- as.factor(ifelse(gbmProb[,"Yes"] > threshold, "Yes", "No"))
+
+# check confusion matrix with adjusted threshold
+print(paste("GBM with threshold =", threshold))
+confusionMatrix(gbm_adjusted_pred, testing$host_is_superhost)$table
+confusionMatrix(gbm_adjusted_pred, testing$host_is_superhost)$overall[1:2]
+```
+
+Adjusting the classification threshold in XGBoost (GBM) impacts accuracy and the balance between false positives and false negatives. A lower threshold (0.3) classifies more hosts as superhosts, increasing recall but also leading to more false positives. Raising the threshold to 0.4 reduces false positives and achieves the highest accuracy. The default threshold of 0.5 is the most conservative, minimizing false positives but increasing false negatives. These results suggest that 0.4 is the optimal threshold for this dataset, striking the best balance between capturing true superhosts and avoiding misclassification.
+
+### Ensemble Model
+
+Finally, I will using an ensemble model, which combines multiple classifiers to improve overall prediction performance. The goal is to leverage the strengths of different models to achieve better accuracy and robustness.
+
+```{r}
+# ensemble model
+# first get the probabilities for the "Yes" class from top models
+rf_probs <- predict(rfFit, testing, type="prob")[,"Yes"]
+gbm_probs <- predict(gbmFit, testing, type="prob")[,"Yes"]
+knn_probs <- predict(knnFit, testing, type="prob")[,"Yes"]
+nn_probs <- predict(nnFit, testing, type="prob")[,"Yes"]
+
+# create ensemble by simple averaging
+ensemble_probs <- (rf_probs + gbm_probs + knn_probs + nn_probs)/4
+
+# try a specific threshold 
+threshold <- 0.3
+ensemble_preds <- as.factor(ifelse(ensemble_probs > threshold, "Yes", "No"))
+print("Ensemble model:")
+confusionMatrix(ensemble_preds, testing$host_is_superhost)$table
+confusionMatrix(ensemble_preds, testing$host_is_superhost)$overall[1:2]
+
+# try another threshold 
+threshold <- 0.4
+ensemble_preds <- as.factor(ifelse(ensemble_probs > threshold, "Yes", "No"))
+print("Ensemble model:")
+confusionMatrix(ensemble_preds, testing$host_is_superhost)$table
+confusionMatrix(ensemble_preds, testing$host_is_superhost)$overall[1:2]
+
+# try a third threshold
+threshold <- 0.5
+ensemble_preds <- as.factor(ifelse(ensemble_probs > threshold, "Yes", "No"))
+print(paste("Ensemble with threshold =", threshold))
+confusionMatrix(ensemble_preds, testing$host_is_superhost)$table
+confusionMatrix(ensemble_preds, testing$host_is_superhost)$overall[1:2]
+```
+
+I created the ensemble model by combining the four best-performing models: XGBoost, Random Forest, k-NN, and Neural Networks. After merging their predictions, I adjusted the threshold, which sets the probability cutoff for classifying a host as a superhost. The accuracy of the ensemble at the optimal threshold is very close to that of the top-performing individual model, Gradient Boosting, and the ensemble is likely more robust since it balances multiple models strengths rather than relying on just one.
+
+## Regression (Interpretation)
+
+#### Data Splitting
+
+I will use the same 70/30 split for regression as I did for classification, but change the target variable.
+
+```{r}
+# split the data
+in_train <- createDataPartition(airbnb_final$price, p = 0.7, list = FALSE)
+training <- airbnb_final[in_train,]
+testing <- airbnb_final[-in_train,]
+nrow(training)
+nrow(testing)
+```
+
+Once again, I'll also use 5 fold cross validation, which will save me some computational efficiency.
+
+```{r}
+# set up 5-fold cross-validation for regression
+ctrl <- trainControl(method = "repeatedcv", 
+                     number = 5, 
+                     repeats = 1,
+                     verboseIter = FALSE,
+                     returnResamp = "all",
+                     summaryFunction = defaultSummary) 
+
+```
+
+#### Linear regression
+
+Similarly to classification, I will use a basic linear model to understand the most important predictors of my regression target, price. I will start by using all the variables.
+
+```{r, warning=FALSE}
+linFit <- lm(log(price) ~ . - latitude - longitude - price, data = training) #only included coord interaction terms to prevent multicollinearity
+summary(linFit)
+
+```
+
+Then I will create a simplified model using the most relevant predictors.
+
+```{r}
+# Create a simplified model with key significant predictors
+simple_model <- lm(
+  log(price) ~ room_type + bathrooms + accommodates + host_listings_count + host_acceptance_rate + review_scores_location + number_of_reviews + availability_365 + minimum_nights_log,
+  data = training
+)
+
+summary(simple_model)
+```
+
+This model highlights key factors influencing Airbnb pricing. Entire homes/apartments are priced higher than other room types, and larger accommodations with higher guest capacity increase price. Hosts with multiple listings tend to charge more, while those with higher acceptance rates set lower prices, possibly reflecting different hosting strategies. High location ratings drive up price, while greater availability, more reviews, and longer minimum stays tend to lower it. This suggests that exclusivity, guest capacity, and perceived quality play a major role in pricing decisions.
+
+#### Decision Tree
+
+I will also create a decision tree to visualize the most predictive variables.
+
+```{r}
+# define control parameters for interpretability
+control <- rpart.control(minsplit = 30, cp = 0.02)
+
+# create a regression decision tree
+dt_regression <- rpart(price ~ ., data = training, method = "anova", control = control)
+
+# plot the regression tree
+rpart.plot(dt_regression, digits = 3)
+```
+
+This decision tree shows that number of bathrooms is a very influential factor when determining airbnb price. Check-in review scores and location, represented by `coords_mult`, also plays an important role.
+
+## Regression (Prediction)
+
+#### Benchmark Model
+ 
+Once again I will start with a simple benchmark model to establish a baseline for comparison.
+
+```{r}
+# calculate the mean price
+mean_price <- mean(training$price)
+
+# create a benchmark model that predicts the mean price for all observations
+benchFit <- lm(price ~ 1, data = training)
+
+# predict on the testing set
+predictions <- rep(mean_price, nrow(testing))
+
+# calculate R-squared
+r_squared <- 1 - (sum((testing$price - predictions)^2) / sum((testing$price - mean(testing$price))^2))
+
+# calculate RMSE
+RMSE <- sqrt(mean((predictions - testing$price)^2))
+
+# print results
+cat("Mean Price:", mean_price, "\n")
+cat("R-squared:", r_squared, "\n")
+cat("RMSE:", RMSE, "\n")
+```
+
+The R-squared value is essentially zero, indicating that the model explains none of the variation in price—this is expected since it does not include any explanatory variables.
+
+### Regularization Models
+
+Now that I have established a baseline, I can start to make predictions. I will first use regularization models including Ridge, Lasso, and Elastic Net. These models help improve prediction accuracy by preventing overfitting, especially when dealing with many correlated variables.
+
+-   Ridge Regression shrinks coefficients toward zero but keeps all predictors, helping when features are highly correlated.
+
+-   Lasso Regression can shrink some coefficients to exactly zero, effectively performing feature selection by removing less important variables.
+
+-   Elastic Net combines Ridge and Lasso, balancing between keeping useful variables and eliminating redundant ones.
+
+By tuning each model’s penalty parameters, I aim to find the best balance between bias and variance, improving predictive performance while avoiding unnecessary complexity.
+
+#### Ridge Regression
+
+```{r}
+# remove zero variance column
+training_cleaned <- training |> 
+  dplyr::select(-neighbourhood_cleansed)
+
+# Define tuning grid for Ridge Regression
+ridge_grid <- expand.grid(lambda = seq(0, 0.1, length = 100))  
+
+# tune Ridge Regression
+ridge_tune_explore <- train(log(price) ~ ., 
+                            data = training_cleaned,
+                            method = 'ridge', 
+                            preProc = c('scale', 'center'),
+                            tuneGrid = ridge_grid,
+                            trControl = ctrl)
+
+# plot the RMSE vs. Lambda
+plot(ridge_tune_explore)  
+
+# select the best lambda
+best_lambda <- ridge_tune_explore$bestTune$lambda
+cat("Best lambda:", best_lambda, "\n")
+
+# retrain Ridge with the best lambda
+ridge_tune <- train(log(price) ~ ., 
+                    data = training_cleaned,
+                    method = 'ridge', 
+                    preProc = c('scale', 'center'),
+                    tuneGrid = expand.grid(lambda = best_lambda),  
+                    trControl = ctrl)
+
+# predict and evaluate
+testing_cleaned <- testing |> 
+  dplyr::select(-neighbourhood_cleansed)
+
+ridge_pred <- predict(ridge_tune, newdata = testing_cleaned)
+ridge_rmse <- sqrt(mean((exp(ridge_pred) - testing$price)^2))
+ridge_r2 <- cor(exp(ridge_pred), testing$price)^2
+
+# print results
+cat("Ridge Regression RMSE: $", round(ridge_rmse, 2), "\n")
+cat("Ridge Regression R²: ", round(ridge_r2, 4), "\n")
+```
+
+#### Lasso Regression
+
+```{r}
+# define tuning grid for Lasso Regression
+lasso_grid <- expand.grid(alpha = 1,  
+                          lambda = seq(0.0001, 1, length = 100))  
+
+# tune Lasso Regression
+lasso_tune_explore <- train(log(price) ~ ., 
+                            data = training_cleaned,
+                            method = 'glmnet',  # Lasso in caret
+                            preProc = c('scale', 'center'),
+                            tuneGrid = lasso_grid,
+                            trControl = ctrl)
+
+# plot the RMSE vs. Lambda
+plot(lasso_tune_explore)  
+
+# select the best lambda
+best_lambda <- lasso_tune_explore$bestTune$lambda
+cat("Best lambda:", best_lambda, "\n")
+
+# retrain Lasso with the best lambda
+lasso_tune <- train(log(price) ~ ., 
+                    data = training_cleaned,
+                    method = 'glmnet',
+                    preProc = c('scale', 'center'),
+                    tuneGrid = expand.grid(alpha = 1, lambda = best_lambda),  
+                    trControl = ctrl)
+
+# predict and evaluate
+lasso_pred <- predict(lasso_tune, newdata = testing_cleaned)
+lasso_rmse <- sqrt(mean((exp(lasso_pred) - testing$price)^2))
+lasso_r2 <- cor(exp(lasso_pred), testing$price)^2
+
+# print results
+cat("Lasso Regression RMSE: $", round(lasso_rmse, 2), "\n")
+cat("Lasso Regression R²: ", round(lasso_r2, 4), "\n")
+```
+
+#### Elastic Net
+
+```{r}
+## define tuning grid for Elastic Net (alpha = 0: Ridge, alpha = 1: Lasso)
+elastic_grid <- expand.grid(alpha = seq(0, 1, length = 10), 
+                             lambda = seq(0.0001, 1, length = 100))  
+
+# tune Elastic Net
+elastic_tune_explore <- train(log(price) ~ ., 
+                              data = training_cleaned,
+                              method = 'glmnet',
+                              preProc = c('scale', 'center'),
+                              tuneGrid = elastic_grid,
+                              trControl = ctrl)
+
+# plot RMSE vs. alpha & lambda
+plot(elastic_tune_explore)
+
+# select the best tuning parameters
+best_alpha <- elastic_tune_explore$bestTune$alpha
+best_lambda <- elastic_tune_explore$bestTune$lambda
+cat("Best alpha:", best_alpha, "\n")
+cat("Best lambda:", best_lambda, "\n")
+
+# retrain Elastic Net with the best alpha & lambda
+elastic_tune <- train(log(price) ~ ., 
+                      data = training_cleaned,
+                      method = 'glmnet',
+                      preProc = c('scale', 'center'),
+                      tuneGrid = expand.grid(alpha = best_alpha, lambda = best_lambda),  
+                      trControl = ctrl)
+
+# prepare test data
+testing_cleaned <- testing |> 
+  dplyr::select(-neighbourhood_cleansed)
+
+# predict and evaluate
+elastic_pred <- predict(elastic_tune, newdata = testing_cleaned)
+elastic_rmse <- sqrt(mean((exp(elastic_pred) - testing$price)^2))
+elastic_r2 <- cor(exp(elastic_pred), testing$price)^2
+
+# print results
+cat("Elastic Net RMSE: $", round(elastic_rmse, 2), "\n")
+cat("Elastic Net R²: ", round(elastic_r2, 4), "\n")
+```
+
+All three regularization models performed similarly, which suggests that the best model would depend on whether interpretability (Lasso) or retaining all predictors (Ridge) is more important for the analysis.
+
+### Machine Learning Models
+
+Next I will move on to machine learning models. I will apply the same models I used to predict superhosts, Nearest Neighbors, Random Forest, Gradient Boosting, and Neural Networks, but this time for a regression task.
+
+```{r}
+# transform price
+training$log_price <- log(training$price)
+testing$log_price <- log(testing$price)
+```
+
+#### Nearest Neighbors
+
+```{r}
+# define proper tuning grid for kknn
+knn_grid <- expand.grid(
+  kmax = seq(5, 30, by = 2),  # Odd values for k (avoid ties)
+  distance = 2,  # Euclidean distance (1 = Manhattan, 2 = Euclidean)
+  kernel = "optimal"  
+)
+
+# train KNN regression with tuning
+knnFit <- train(log_price ~ ., 
+                data = training,
+                method = "kknn", 
+                preProcess = c("center", "scale", "nzv"),
+                tuneGrid = knn_grid,
+                metric = "RMSE",
+                trControl = ctrl)
+
+# plot RMSE vs. kmax
+plot(knnFit)
+
+# best tuning parameters
+best_k <- knnFit$bestTune$kmax
+cat("Best k:", best_k, "\n")
+
+# retrain using the best k
+knnFit_final <- train(log_price ~ ., 
+                      data = training,
+                      method = "kknn", 
+                      preProcess = c("center", "scale", "nzv"),
+                      tuneGrid = expand.grid(
+                        kmax = best_k, 
+                        distance = 2, 
+                        kernel = "optimal"
+                      ),
+                      metric = "RMSE",
+                      trControl = ctrl)
+
+# predict and evaluate
+knnPred <- exp(predict(knnFit_final, testing))
+knn_rmse <- sqrt(mean((knnPred - testing$price)^2))
+knn_r2 <- cor(knnPred, testing$price)^2
+
+# print results
+cat("KNN Regression RMSE: $", round(knn_rmse, 2), "\n")
+cat("KNN Regression R²: ", round(knn_r2, 4), "\n")
+
+```
+
+#### Random Forest
+
+```{r}
+# define tuning grid for Random Forest
+rf_grid <- expand.grid(
+  mtry = seq(2, 12, by = 2),  
+  splitrule = "variance",  
+  min.node.size = c(5, 10, 15, 20)  
+)
+
+# train Random Forest model
+rfFit_explore <- train(log_price ~ ., 
+                       data = training,
+                       method = "ranger",   
+                       preProcess = c("center", "scale", "nzv"),
+                       tuneGrid = rf_grid,
+                       metric = "RMSE",
+                       trControl = ctrl)
+
+# plot RMSE vs. parameters
+plot(rfFit_explore)
+
+# best tuning parameters
+best_mtry <- rfFit_explore$bestTune$mtry
+best_min_node_size <- rfFit_explore$bestTune$min.node.size
+cat("Best mtry:", best_mtry, "\n")
+cat("Best min.node.size:", best_min_node_size, "\n")
+
+# retrain with best parameters
+rfFit <- train(log_price ~ ., 
+               data = training,
+               method = "ranger",   
+               preProcess = c("center", "scale", "nzv"),
+               tuneGrid = expand.grid(
+                 mtry = best_mtry,
+                 splitrule = "variance",
+                 min.node.size = best_min_node_size
+               ),
+               metric = "RMSE",
+               trControl = ctrl)
+
+# predict and evaluate
+rfPred <- exp(predict(rfFit, testing))
+rf_rmse <- sqrt(mean((rfPred - testing$price)^2))
+rf_r2 <- cor(rfPred, testing$price)^2
+
+# print results
+cat("Random Forest RMSE: $", round(rf_rmse, 2), "\n")
+cat("Random Forest R²: ", round(rf_r2, 4), "\n")
+```
+
+#### Gradient Boosting
+
+```{r}
+# Define tuning grid for Gradient Boosting
+# NOTE: I ran this model multiple times with progressively more aggressive regularization to try and prevent overfitting
+xgb_grid <- expand.grid(
+  nrounds = c(50, 100, 200),  # reduce boosting rounds (prevents excessive complexity)
+  max_depth = c(2, 4),  # shallower trees force generalization
+  eta = c(0.005, 0.01, 0.05),  # slower learning to prevent overfitting 
+  gamma = c(5, 10),  # requires more significant splits (reduces unnecessary complexity)
+  colsample_bytree = c(0.4, 0.6),  # uses fewer features per tree (adds randomness)
+  min_child_weight = c(10, 20),  # forces larger leaf sizes (prevents fitting to small patterns)
+  subsample = c(0.4, 0.6)  # uses only part of the data for each tree (prevents over-reliance on full dataset)
+)
+
+  # train Gradient Boosting model
+suppressWarnings(
+  invisible(
+    capture.output(
+      gbmFit_explore <- train(log_price ~ ., 
+                              data = training,
+                              method = "xgbTree",   
+                              preProcess = c("center", "scale", "nzv"),
+                              tuneGrid = xgb_grid,
+                              metric = "RMSE",
+                              trControl = ctrl,
+                              verbose = FALSE)
+    )
+  )
+)
+
+# plot RMSE vs. parameters
+plot(gbmFit_explore)
+
+# best tuning parameters
+best_params <- gbmFit_explore$bestTune
+print("Best Parameters:")
+print(best_params)
+
+# retrain XGBoost with the best parameters 
+suppressWarnings(
+  invisible(
+    capture.output(
+      gbmFit <- train(log_price ~ ., 
+                      data = training,
+                      method = "xgbTree",   
+                      preProcess = c("center", "scale", "nzv"),
+                      tuneGrid = best_params,  # Use best parameters
+                      metric = "RMSE",
+                      trControl = ctrl,
+                      verbose = FALSE)
+    )
+  )
+)
+
+# predict and evaluate
+gbmPred <- exp(predict(gbmFit, testing))
+gbm_rmse <- sqrt(mean((gbmPred - testing$price)^2))
+gbm_r2 <- cor(gbmPred, testing$price)^2
+
+# print results
+cat("Gradient Boosting RMSE: $", round(gbm_rmse, 2), "\n")
+cat("Gradient Boosting R²: ", round(gbm_r2, 4), "\n")
+```
+
+#### Neural Networks
+
+```{r}
+# define tuning grid for Neural Network
+nn_grid <- expand.grid(
+  size = c(2, 4, 6, 8, 10),  
+  decay = c(0.0001, 0.001, 0.01, 0.1, 0.5)  
+)
+
+# train Neural Network Model
+nnFit_explore <- train(log_price ~ ., 
+                       data = training,
+                       method = "nnet",  
+                       preProcess = c("center", "scale", "nzv"),
+                       trControl = ctrl,
+                       tuneGrid = nn_grid,
+                       metric = "RMSE",
+                       trace = FALSE,  
+                       maxit = 500)  
+
+# plot RMSE vs. Parameters
+plot(nnFit_explore)
+
+# best tuning parameters
+best_nn_size <- nnFit_explore$bestTune$size
+best_nn_decay <- nnFit_explore$bestTune$decay
+cat("Best size:", best_nn_size, "\n")
+cat("Best decay:", best_nn_decay, "\n")
+
+# retrain with Best Parameters
+nnFit <- train(log_price ~ ., 
+               data = training,
+               method = "nnet",  
+               preProcess = c("center", "scale", "nzv"),
+               trControl = ctrl,
+               tuneGrid = expand.grid(
+                 size = best_nn_size,
+                 decay = best_nn_decay
+               ),
+               metric = "RMSE",
+               trace = FALSE,  
+               maxit = 500)
+
+# predict and evaluate
+nnPred <- exp(predict(nnFit, testing))
+nn_rmse <- sqrt(mean((nnPred - testing$price)^2))
+nn_r2 <- cor(nnPred, testing$price)^2
+
+# print results
+cat("Neural Network RMSE: $", round(nn_rmse, 2), "\n")
+cat("Neural Network R²: ", round(nn_r2, 4), "\n")
+```
+
+In this task Nearest Neighbors performs best, which indicates that location likely plays an important role in price. Gradient Boosting and Random Forest also performed relatively well. Neural Networks had the worst performance, with a very high RMSE and low R², confirming once again that deep learning is not ideal for tabular data with limited features.
+
+### Comparing Models
+
+Finally, I will compare all regression models including regularization and ML models.
+
+```{r}
+# store model predictions
+test_results <- data.frame(
+  price = testing$price,
+  Ridge = exp(predict(ridge_tune, testing)),
+  Lasso = exp(predict(lasso_tune, testing)),
+  ElasticNet = exp(predict(elastic_tune, testing)),
+  KNN = exp(predict(knnFit, testing)),
+  RandomForest = exp(predict(rfFit, testing)),
+  GradientBoosting = exp(predict(gbmFit, testing)),
+  NeuralNetwork = exp(predict(nnFit, testing))
+)
+
+# compute RMSE, R², and MAE
+model_results <- data.frame(
+  Model = colnames(test_results[-1]),
+  RMSE = apply(test_results[-1], 2, function(x) sqrt(mean((x - test_results$price)^2))),
+  R2 = apply(test_results[-1], 2, function(x) cor(x, test_results$price)^2),
+  MAE = apply(test_results[-1], 2, function(x) mean(abs(x - test_results$price)))  # Your professor's method
+)
+
+# sort models by RMSE (best model = lowest RMSE)
+model_results <- model_results |> arrange(RMSE)
+print(model_results)
+```
+
+Similarly to classification, the ML regression models outperformed the regularization models in prediction, with Nearest Neighbors having the highest prediction accuracy overall.
+
+### Ensemble Model
+
+I once again combined my top-performing models into an ensemble model, to balance the strengths and weaknesses of both.
+
+```{r}
+# get predicted prices from individual models (exponentiate if using log-price)
+rf_pred <- exp(predict(rfFit, testing))
+gbm_pred <- exp(predict(gbmFit, testing))
+knn_pred <- exp(predict(knnFit, testing))
+
+# create ensemble prediction by averaging model outputs
+ensemble_pred <- (rf_pred + gbm_pred + knn_pred) / 3
+
+# evaluate ensemble model performance
+ensemble_rmse <- sqrt(mean((ensemble_pred - testing$price)^2))
+ensemble_r2 <- cor(ensemble_pred, testing$price)^2
+
+# print results
+cat("Ensemble Model RMSE: $", round(ensemble_rmse, 2), "\n")
+cat("Ensemble Model R²: ", round(ensemble_r2, 4), "\n")
+
+```
+
+While this model does not have quite as high of an R² as Nearest Neighbors, it is important to note that this model is likely more robust.
+
+## Conclusion
+
+This exercise reinforced key insights about model selection based on the task. Tree-based models (Random Forest, GBM) consistently performed well for both classification and regression, with more computationally expensive models achieving higher accuracy. Neural networks, although powerful, are generally not well suited for the type of tabular data used in this exercise.
+
+Another key takeaway is that statistical methods are generally better for understanding relationships, while machine learning excels at optimizing predictions. However, as descriptive ML techniques become more common, the line between interpretability and accuracy is shifting. Ultimately, the best model depends on the goal—prioritizing explainability or maximizing predictive performance, and this analysis demonstrated when each approach is most effective.
+
+## Bibliography
+
+-   **Inside Airbnb.** (n.d.). *Get the data*. Retrieved March 13, 2025, from <https://insideairbnb.com/get-the-data/>
